@@ -697,6 +697,19 @@ void checkClient(struct Client *sptr, struct Client *acptr, int flags)
                             && cli_fd(acptr) >= 0);
          int has_remote_primary = (!has_primary && session->hs_state == BOUNCE_ACTIVE
                                    && IsUser(acptr) && !MyConnect(acptr));
+         /* The server holding the session: its primary's.  The origin the
+          * record noted is shown only for a session with no primary (it
+          * goes stale: a ghost rebind keeps it, a merge moves it). */
+         struct Client *home = bounce_primary_server(session);
+         const char *home_name = home ? cli_name(home) : session->hs_origin;
+         int home_local = home ? IsMe(home)
+                               : (0 == strcmp(session->hs_origin, cli_yxx(&me)));
+         /* Where the session's primary is (the target itself may be an
+          * alias of it on another server). */
+         const char *primary_server_name =
+            home ? cli_name(home)
+                 : (cli_user(acptr) && cli_user(acptr)->server
+                      ? cli_name(cli_user(acptr)->server) : "?");
 
          /* Determine state string */
          if (session->hs_state == BOUNCE_ACTIVE) {
@@ -728,13 +741,14 @@ void checkClient(struct Client *sptr, struct Client *acptr, int flags)
          }
 
          /* Managing server */
-         {
+         if (!home) {
             struct Client *mgr = FindNServer(session->hs_origin);
-            ircd_snprintf(0, outbuf, sizeof(outbuf), "Managing server:: %s (%s)",
-                          mgr ? cli_name(mgr) : session->hs_origin,
-                          (0 == strcmp(session->hs_origin, cli_yxx(&me))) ? "local" : "remote");
-            send_reply(sptr, RPL_DATASTR, outbuf);
+            if (mgr)
+               home_name = cli_name(mgr);
          }
+         ircd_snprintf(0, outbuf, sizeof(outbuf), "Managing server:: %s (%s)",
+                       home_name, home_local ? "local" : "remote");
+         send_reply(sptr, RPL_DATASTR, outbuf);
 
          /* Connections breakdown */
          {
@@ -744,9 +758,8 @@ void checkClient(struct Client *sptr, struct Client *acptr, int flags)
             if (session->hs_state != BOUNCE_ACTIVE) {
                ircd_snprintf(0, outbuf, sizeof(outbuf), "    Connections:: 0 (holding)");
             } else if (has_remote_primary && aliases == 0) {
-               struct Client *mgr = FindNServer(session->hs_origin);
                ircd_snprintf(0, outbuf, sizeof(outbuf), "    Connections:: primary on %s",
-                             mgr ? cli_name(mgr) : session->hs_origin);
+                             primary_server_name);
             } else if (has_primary && aliases == 0) {
                ircd_snprintf(0, outbuf, sizeof(outbuf), "    Connections:: 1 (primary only)");
             } else {
@@ -755,9 +768,8 @@ void checkClient(struct Client *sptr, struct Client *acptr, int flags)
                if (has_primary)
                   p += ircd_snprintf(0, p, sizeof(detail) - (p - detail), "1 primary");
                else if (has_remote_primary) {
-                  struct Client *mgr = FindNServer(session->hs_origin);
                   p += ircd_snprintf(0, p, sizeof(detail) - (p - detail), "primary on %s",
-                                     mgr ? cli_name(mgr) : session->hs_origin);
+                                     primary_server_name);
                } else
                   p += ircd_snprintf(0, p, sizeof(detail) - (p - detail), "no primary");
                if (aliases > 0)
@@ -913,16 +925,14 @@ void checkClient(struct Client *sptr, struct Client *acptr, int flags)
             ircd_snprintf(0, outbuf, sizeof(outbuf), "     Away state:: %s", away_str);
             send_reply(sptr, RPL_DATASTR, outbuf);
          } else if (has_remote_primary) {
-            struct Client *mgr;
             send_reply(sptr, RPL_DATASTR, " ");
-            mgr = FindNServer(session->hs_origin);
             ircd_snprintf(0, outbuf, sizeof(outbuf), "  Primary (remote)::");
             send_reply(sptr, RPL_DATASTR, outbuf);
             ircd_snprintf(0, outbuf, sizeof(outbuf), "         Numeric:: %s%s",
                           cli_yxx(cli_user(acptr)->server), cli_yxx(acptr));
             send_reply(sptr, RPL_DATASTR, outbuf);
             ircd_snprintf(0, outbuf, sizeof(outbuf), "          Server:: %s",
-                          mgr ? cli_name(mgr) : session->hs_origin);
+                          primary_server_name);
             send_reply(sptr, RPL_DATASTR, outbuf);
             ircd_snprintf(0, outbuf, sizeof(outbuf), "              IP:: %s",
                           ircd_ntoa(&cli_ip(acptr)));
@@ -969,8 +979,11 @@ void checkClient(struct Client *sptr, struct Client *acptr, int flags)
           *   BouncerPrimary:: <numeric> <nick> <lastnick> <sessid> <server> <locality>
           *   BouncerAlias:: <idx> <numeric> <nick> <lastnick> <sessid> <server> <locality> <primary_numeric>
           *   BouncerFace:: <idx> <peer_yxx> <face_numeric>
+          *   BouncerSession:: <sessid> <ACTIVE|HOLDING> <hs_client_numeric>
           * locality is "local" or "remote".  primary_numeric is the alias's
-          * cli_alias_primary numeric, or "-" if unresolved.
+          * cli_alias_primary numeric, or "-" if unresolved.  BouncerPrimary
+          * describes the CHECK target; BouncerSession the session record's
+          * own primary slot (hs_client), "-" when empty.
           */
          if (flags & CHECK_BOUNCER) {
             int ai;
@@ -988,6 +1001,20 @@ void checkClient(struct Client *sptr, struct Client *acptr, int flags)
                           prim_svr_name,
                           prim_loc);
             send_reply(sptr, RPL_DATASTR, outbuf);
+
+            {
+               char slot_num[12] = "-";
+               struct Client *slot = session->hs_client;
+               if (slot && cli_user(slot) && cli_user(slot)->server)
+                  ircd_snprintf(0, slot_num, sizeof(slot_num), "%s%s",
+                                cli_yxx(cli_user(slot)->server), cli_yxx(slot));
+               ircd_snprintf(0, outbuf, sizeof(outbuf),
+                             "BouncerSession:: %s %s %s", session->hs_sessid,
+                             session->hs_state == BOUNCE_ACTIVE ? "ACTIVE"
+                                                                : "HOLDING",
+                             slot_num);
+               send_reply(sptr, RPL_DATASTR, outbuf);
+            }
 
             for (ai = 0; ai < session->hs_alias_count; ai++) {
                struct BounceAlias *ba = &session->hs_aliases[ai];

@@ -349,8 +349,11 @@ int ws_flush_txrem(struct Client *cptr, unsigned int *wrote_out)
   assert(0 != con_ws_txrem(wcon));
 #ifdef USE_SSL
   if (cli_socket(cptr).ssl) {
-    int sr = SSL_write(cli_socket(cptr).ssl,
-                       con_ws_txrem(wcon) + con_ws_txrem_pos(wcon), remlen);
+    int sr;
+
+    ssl_clear_errors("before SSL_write");
+    sr = SSL_write(cli_socket(cptr).ssl,
+                   con_ws_txrem(wcon) + con_ws_txrem_pos(wcon), remlen);
     if (sr > 0) { wrote = (unsigned)sr; r = IO_SUCCESS; }
     else {
       int se = SSL_get_error(cli_socket(cptr).ssl, sr);
@@ -523,7 +526,10 @@ unsigned int deliver_it(struct Client *cptr, struct MsgQ *buf)
 
 #ifdef USE_SSL
           if (cli_socket(cptr).ssl) {
-            int send_result = SSL_write(cli_socket(cptr).ssl, ws_frame, frame_len);
+            int send_result;
+
+            ssl_clear_errors("before SSL_write");
+            send_result = SSL_write(cli_socket(cptr).ssl, ws_frame, frame_len);
             if (send_result > 0) {
               result = IO_SUCCESS;
               total_ws_written += send_result;
@@ -729,14 +735,19 @@ static int completed_connection(struct Client* cptr)
   ClearPingSent(cptr);
 
   /* Flag string: h=hub, 6=ipv6, o=oplevels, v=IRCv3-aware S2S extensions,
-   * F=BX F (reconcile-end) handshake supported.
+   * F=BX F (reconcile-end) handshake supported, H=bouncer hold mark (,H)
+   * stamped and relayed (only while P10_MESSAGE_TAGS is on: the mark
+   * rides the compact tags).
    * Legacy peers ignore unknown flag chars. */
-  sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svF :%s",
+  sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svF%s :%s",
                 cli_name(&me), cli_serv(&me)->timestamp, newts,
 		MAJOR_PROTOCOL, NumServCap(&me),
 		feature_bool(FEAT_HUB) ? "h" : "",
                 feature_bool(FEAT_OPLEVELS) ? "o" : "",
+                feature_bool(FEAT_P10_MESSAGE_TAGS) ? "H" : "",
                 cli_info(&me));
+  if (feature_bool(FEAT_P10_MESSAGE_TAGS))
+    SetHoldMarkSent(cptr);
 
   return (IsDead(cptr)) ? 0 : 1;
 }
@@ -750,10 +761,12 @@ static const char *dead_reason(struct Client *cptr, const char *dflt)
          ? cli_exit_reason(cptr) : dflt;
 }
 
-/** Exit a client whose socket died -- or hold it, when it is the primary
- * of a bouncer session that holds: the decision client_sock_callback()
- * makes for an EOF or a read error.  A write error or a sendQ overflow is
- * a dropped connection too (user decision 2026-10-21); the parse loops and
+/** Exit a client whose socket died -- or let the bouncer keep its
+ * session, when it is a session primary: the decision
+ * client_sock_callback() makes for an EOF or a read error.  A write error
+ * or a sendQ overflow is a dropped connection too (user decision
+ * 2026-10-21): a live device of the session takes over, as after a QUIT,
+ * else the session holds (bounce_promote_or_hold()).  The parse loops and
  * check_pings() exited it outright, and a session with no other
  * connection ended with it.
  * @param[in] cptr Local client marked dead.
@@ -767,7 +780,9 @@ int exit_dead_client(struct Client *cptr, const char *dflt)
   if (IsUser(cptr) && !IsBouncerAlias(cptr)) {
     if (IsBouncerHold(cptr))
       return 0;
-    if (bounce_should_hold(cptr) && bounce_hold_client(cptr, msg) == 0)
+    /* Held: 0.  A device here took over (1), or nothing to keep: the
+     * client exits; after a promote its channels are already left. */
+    if (bounce_promote_or_hold(cptr, msg) == 0)
       return 0;
   }
   return exit_client(cptr, cptr, &me, (char *)msg);
@@ -1134,6 +1149,20 @@ void update_write(struct Client* cptr)
 		 SOCK_ACTION_ADD : SOCK_ACTION_DEL) | SOCK_EVENT_WRITABLE);
 }
 
+/** A connection fault forces @a cptr off: a flood, a WebSocket frame,
+ * size, fragment or UTF-8 error, a receive buffer that took no more
+ * data.  A fault is not an oper's verdict (user, 2026-10-27: bans end the
+ * session, faults promote): a session primary's other device takes over,
+ * or the session holds, as for a dead socket (bounce_forced_exit()).
+ * @return CPTR_KILLED, as exit_client() returns it for cptr itself. */
+static int exit_client_fault(struct Client *cptr, enum bounce_forced_exit why,
+                             const char *comment)
+{
+  if (bounce_forced_exit(cptr, cptr, why, comment))
+    return CPTR_KILLED; /* held: the ghost keeps the client, not the socket */
+  return exit_client(cptr, cptr, &me, comment);
+}
+
 /** Read a 'packet' of data from a connection and process it.  Read in
  * 8k chunks to give a better performance rating (for server
  * connections).  Do some tricky stuff for client connections to make
@@ -1189,7 +1218,7 @@ ssl_read_again:
     if (ssl_pending(&cli_socket(cptr)) > 0) {
       /* Buffer current data and read more */
       if (dbuf_put(&(cli_recvQ(cptr)), readbuf, length) == 0)
-        return exit_client(cptr, cptr, &me, "dbuf_put fail");
+        return exit_client_fault(cptr, BOUNCE_FORCED_BUFFER, "dbuf_put fail");
       length = 0;
       goto ssl_read_again;
     }
@@ -1212,6 +1241,10 @@ ssl_read_again:
     if (result > 0 && cli_socket(cptr).ssl && ssl_pending(&cli_socket(cptr)) > 0)
       goto ssl_read_again;
 #endif
+    /* This read of the link is parsed: a registration deferred on its
+     * unread bytes may go ahead now (W3 12c-2b fix 2, row 412). */
+    if (result > 0)
+      bounce_link_input_read(cptr);
     return result;
   }
   else if (length > 0 && (IsHandshake(cptr) || IsConnecting(cptr))) {
@@ -1226,6 +1259,10 @@ ssl_read_again:
     if (result > 0 && cli_socket(cptr).ssl && ssl_pending(&cli_socket(cptr)) > 0)
       goto ssl_read_again;
 #endif
+    /* A link that registered in this read may have sent its whole burst,
+     * end of burst included, in it (fix round 3, I-1). */
+    if (result > 0 && IsServer(cptr))
+      bounce_link_input_read(cptr);
     return result;
   }
   else
@@ -1267,7 +1304,7 @@ ssl_read_again:
         /* Flush any previously buffered bytes into recvQ */
         if (buffered > 0) {
           if (dbuf_put(&(cli_recvQ(cptr)), client_buffer, buffered) == 0)
-            return exit_client(cptr, cptr, &me, "dbuf_put fail");
+            return exit_client_fault(cptr, BOUNCE_FORCED_BUFFER, "dbuf_put fail");
           cli_count(cptr) = 0;
         }
         /* readbuf falls through to normal dbuf_put below */
@@ -1382,7 +1419,7 @@ ssl_read_again:
              * a frame the decoder accepts (WS_MAX_FRAME covers the largest
              * header plus WS_MAX_PAYLOAD), so treat it as a protocol error
              * rather than spin. */
-            return exit_client(cptr, cptr, &me, "WebSocket frame error");
+            return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket frame error");
           }
           if (copy_len > src_len)
             copy_len = src_len;
@@ -1394,11 +1431,11 @@ ssl_read_again:
         } else if (consumed == WS_DECODE_TOOBIG) {
           /* Over WS_MAX_PAYLOAD: tell the client why before dropping it */
           websocket_send_close(cptr, 1009, "Message too big");
-          return exit_client(cptr, cptr, &me, "WebSocket message too big");
+          return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket message too big");
         } else if (consumed < 0) {
           /* Frame error */
           Debug((DEBUG_DEBUG, "WebSocket: Frame error (consumed=%d)", consumed));
-          return exit_client(cptr, cptr, &me, "WebSocket frame error");
+          return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket frame error");
         }
 
         Debug((DEBUG_DEBUG, "WebSocket frame payload: '%.50s'", ws_payload));
@@ -1417,7 +1454,7 @@ ssl_read_again:
           cli_ws_ctl_since(cptr) += WS_CONTROL_FLOOD_CHARGE;
           if (cli_ws_ctl_since(cptr) - CurrentTime > WS_CONTROL_FLOOD_CEIL) {
             websocket_send_close(cptr, 1008, "Excess Flood");
-            return exit_client(cptr, cptr, &me, "Excess Flood");
+            return exit_client_fault(cptr, BOUNCE_FORCED_FLOOD, "Excess Flood");
           }
         }
 
@@ -1425,19 +1462,16 @@ ssl_read_again:
         if (opcode >= WS_OPCODE_CLOSE) {
           if (!websocket_handle_control(cptr, opcode, ws_payload, ws_len)) {
             /* Close frame received.  A WS CLOSE is transport teardown --
-             * the WebSocket-layer FIN -- so route it through the bouncer
-             * hold gate exactly like the dead-link path below (~1746)
-             * does for a TCP drop.  Every other disconnect entry point
-             * (dead-link, QUIT, ping timeout) consults the gate; without
-             * this, a clean WS close destroyed a persistent session an
-             * unclean drop would have kept.  Mirrors the dead-link
-             * shape deliberately: no immediate-promote shortcut here
-             * (see that site's comment for the promote/BX X race). */
-            if (IsUser(cptr) && bounce_should_hold(cptr)) {
-              if (bounce_hold_client(cptr, "WebSocket closed") == 0)
-                return CPTR_KILLED; /* held: ghost owns the socket now */
-              /* hold failed -> fall through to normal exit */
-            }
+             * the WebSocket-layer FIN -- so it goes through the bouncer's
+             * disconnect rule exactly like the dead-link path below does
+             * for a TCP drop, and a QUIT does: a live device of the
+             * session takes over, else the session holds or (hold off)
+             * ends.  Without this, a clean WS close destroyed a
+             * persistent session an unclean drop would have kept. */
+            if (IsUser(cptr) && !IsBouncerAlias(cptr)
+                && bounce_promote_or_hold(cptr, "WebSocket closed") == 0)
+              return CPTR_KILLED; /* held: ghost owns the socket now */
+            /* Promoted here (channels already left), or nothing to keep */
             return exit_client(cptr, cptr, &me, "WebSocket closed");
           }
         }
@@ -1449,7 +1483,7 @@ ssl_read_again:
             cli_ws_frag_len(cptr) += ws_len;
           } else {
             /* Fragment too large */
-            return exit_client(cptr, cptr, &me, "WebSocket fragment overflow");
+            return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket fragment overflow");
           }
           if (is_fin) {
             /* Fragment complete - deliver reassembled message */
@@ -1460,14 +1494,14 @@ ssl_read_again:
               if (cli_ws_frag_opcode(cptr) == WS_OPCODE_TEXT) {
                 frag_data[frag_len] = '\0';
                 if (!string_is_valid_utf8(frag_data))
-                  return exit_client(cptr, cptr, &me, "WebSocket text frame: invalid UTF-8");
+                  return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket text frame: invalid UTF-8");
               }
               /* Add line ending if needed */
               if (frag_len < 16384 - 1 && frag_data[frag_len - 1] != '\n') {
                 frag_data[frag_len++] = '\n';
               }
               if (dbuf_put(&(cli_recvQ(cptr)), frag_data, frag_len) == 0)
-                return exit_client(cptr, cptr, &me, "dbuf_put fail");
+                return exit_client_fault(cptr, BOUNCE_FORCED_BUFFER, "dbuf_put fail");
             }
             cli_ws_frag_len(cptr) = 0;
             cli_ws_frag_opcode(cptr) = 0;
@@ -1493,7 +1527,7 @@ ssl_read_again:
               memcpy(cli_ws_frag_buf(cptr), ws_payload, ws_len);
               cli_ws_frag_len(cptr) = ws_len;
             } else {
-              return exit_client(cptr, cptr, &me, "WebSocket fragment overflow");
+              return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket fragment overflow");
             }
           } else {
             /* Complete frame - deliver immediately */
@@ -1516,12 +1550,12 @@ ssl_read_again:
               {
                 int classify = recv_classify(cptr, (const char *)ws_payload, ws_len);
                 if (classify == RECV_CLASSIFY_TAG_OVERRUN)
-                  return exit_client(cptr, cptr, &me, "Excess Flood: tag region too large");
+                  return exit_client_fault(cptr, BOUNCE_FORCED_FLOOD, "Excess Flood: tag region too large");
                 if (classify == RECV_CLASSIFY_MSG_OVERRUN)
-                  return exit_client(cptr, cptr, &me, "Excess Flood: message region too large");
+                  return exit_client_fault(cptr, BOUNCE_FORCED_FLOOD, "Excess Flood: message region too large");
               }
               if (dbuf_put(&(cli_recvQ(cptr)), ws_payload, ws_len) == 0)
-                return exit_client(cptr, cptr, &me, "dbuf_put fail");
+                return exit_client_fault(cptr, BOUNCE_FORCED_BUFFER, "dbuf_put fail");
             }
           }
         }
@@ -1545,11 +1579,11 @@ ssl_read_again:
     if (length > 0) {
       int classify = recv_classify(cptr, readbuf, length);
       if (classify == RECV_CLASSIFY_TAG_OVERRUN)
-        return exit_client(cptr, cptr, &me, "Excess Flood: tag region too large");
+        return exit_client_fault(cptr, BOUNCE_FORCED_FLOOD, "Excess Flood: tag region too large");
       if (classify == RECV_CLASSIFY_MSG_OVERRUN)
-        return exit_client(cptr, cptr, &me, "Excess Flood: message region too large");
+        return exit_client_fault(cptr, BOUNCE_FORCED_FLOOD, "Excess Flood: message region too large");
       if (dbuf_put(&(cli_recvQ(cptr)), readbuf, length) == 0)
-        return exit_client(cptr, cptr, &me, "dbuf_put fail");
+        return exit_client_fault(cptr, BOUNCE_FORCED_BUFFER, "dbuf_put fail");
     }
 
     /*
@@ -1567,7 +1601,7 @@ ssl_read_again:
      */
     {
       if (DBufLength(&(cli_recvQ(cptr))) > get_recvq(cptr) + FULL_MSG_SIZE)
-        return exit_client(cptr, cptr, &me, "Excess Flood");
+        return exit_client_fault(cptr, BOUNCE_FORCED_FLOOD, "Excess Flood");
     }
 
     while (DBufLength(&(cli_recvQ(cptr))) && !NoNewLine(cptr) && 
@@ -1975,6 +2009,22 @@ void client_sock_callback(struct Event* ev)
     if (!msg)
       msg = "Unknown error";
 
+    /* Re-entrancy guard.  Nefarious's event model is synchronous
+     * (event_add == event_execute).  If we got here via an ET_ERROR
+     * synthesised from inside engine_set_events on epoll_ctl failure —
+     * which can happen when send_buffer → update_write → socket_events
+     * tries to MOD a dead fd — then the outer frame is already inside
+     * exit_client (FLAG_CLOSING is set there).  A recursive
+     * exit_client_msg here would run remove_client_from_list, zero
+     * cli_connect, and return into the outer send_buffer mid-line,
+     * which then NULL-derefs at `++cli_sendM(to)`.  Let the outer
+     * frame finish the teardown; we've already marked DEADSOCKET.
+     * First, before the bouncer is asked: the client is already on its
+     * way out, and its exit decided what happens to its session (a
+     * promote or hold here would act on a client being exited). */
+    if (HasFlag(cptr, FLAG_CLOSING))
+      return;
+
     /* Bouncer alias: skip hold logic — just clean up.
      * exit_client_msg() → exit_client() sends BX X to other servers. */
     if (IsUser(cptr) && IsBouncerAlias(cptr)) {
@@ -1987,40 +2037,26 @@ void client_sock_callback(struct Event* ev)
     if (IsUser(cptr) && IsBouncerHold(cptr))
       return;
 
-    /* Check if client should enter bouncer HOLD mode instead of exiting.
-     *
-     * No immediate-promote shortcut here: a primary disconnect with
-     * aliases attached must hold first, even when promote *looks* viable.
-     * Otherwise the alias's server may concurrently be tearing down the
-     * same alias (BX X) — promote and BX X cross on the wire and both
-     * sides converge to a session pointing at a destroyed numeric, with
-     * channel state lost.  Promotion runs only from bounce_hold_expire,
-     * after the network has settled and hs_alias_count reflects reality.
-     * Cooperative roaming (user alive on both ends) uses BX C session
-     * move instead — that path doesn't touch this disconnect handler. */
-    if (IsUser(cptr) && bounce_should_hold(cptr)) {
-      /* Transition to ghost/hold state - suppresses QUIT, keeps channels */
-      if (bounce_hold_client(cptr, msg) == 0) {
-        /* Successfully entered hold - don't exit_client */
-        return;
-      }
-      /* If hold failed, fall through to normal exit */
+    /* A session primary: an EOF or a read error goes through the
+     * bouncer's disconnect rule as a QUIT does (bounce_promote_or_hold).
+     * A live device of the session takes over: one on this server at
+     * once (its state here is the truth, so the BX P cannot cross its own
+     * BX X), one on another server after a hold, at the next tick: a BX X
+     * for it this server has already read is seen first, one still on the
+     * wire can cross the BX P (narrowed, not closed).  With no device the
+     * session holds, or with hold off ends.  Cooperative roaming (user alive on
+     * both ends) uses the BX C session move instead. */
+    {
+      /* The exit's own comment ("Read error: ..."): a hold keeps it, and
+       * a hold that ends with nothing to take over leaves with it. */
+      char reason[1024];
+
+      ircd_snprintf(0, reason, sizeof(reason), fmt, msg);
+      if (IsUser(cptr) && bounce_promote_or_hold(cptr, reason) == 0)
+        return; /* held: the ghost keeps its channels, no QUIT */
+      /* Promoted here (channels already left), or nothing to keep */
+      exit_client(cptr, cptr, &me, reason);
     }
-
-    /* Re-entrancy guard.  Nefarious's event model is synchronous
-     * (event_add == event_execute).  If we got here via an ET_ERROR
-     * synthesised from inside engine_set_events on epoll_ctl failure —
-     * which can happen when send_buffer → update_write → socket_events
-     * tries to MOD a dead fd — then the outer frame is already inside
-     * exit_client (FLAG_CLOSING set at s_misc.c:768).  A recursive
-     * exit_client_msg here would run remove_client_from_list, zero
-     * cli_connect, and return into the outer send_buffer mid-line,
-     * which then NULL-derefs at `++cli_sendM(to)`.  Let the outer
-     * frame finish the teardown; we've already marked DEADSOCKET. */
-    if (HasFlag(cptr, FLAG_CLOSING))
-      return;
-
-    exit_client_msg(cptr, cptr, &me, fmt, msg);
   }
 }
 

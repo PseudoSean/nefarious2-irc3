@@ -72,6 +72,7 @@ typedef void (*InfoFormatter)(struct Client* who, struct Client *sptr, struct Ms
  */
 extern struct User* make_user(struct Client *cptr);
 extern void         free_user(struct User *user);
+extern void         free_user_lists(struct Client *cptr);
 extern int          register_user(struct Client* cptr, struct Client *sptr);
 
 extern void         user_count_memory(size_t* count_out, size_t* bytes_out);
@@ -79,6 +80,25 @@ extern void         user_count_memory(size_t* count_out, size_t* bytes_out);
 extern int set_nick_name(struct Client* cptr, struct Client* sptr,
                          const char* nick, int parc, char* parv[],
                          int svsnick);
+/* One-shot: the next register_user() of a remote client relays its N to
+ * IRCv3-aware links only (legacy links learn that user some other way,
+ * e.g. a BX P renumbering a face they already hold).  Every
+ * register_user() call clears it, whatever client it registers; arm it
+ * immediately before the set_nick_name() that introduces the client and
+ * clear it again when that call returns. */
+extern void set_nick_relay_withhold_legacy(void);
+extern void clear_nick_relay_withhold_legacy(void);
+/** Apply one mode-synced flag (metadata_mode_sync[]) that an account row
+ * changed to one of OUR connections of the account, the way a self MODE
+ * looks: the flag, the user counts, the client told (MODE <nick> +x, not
+ * for a held ghost), an M line to every server, and the session's local
+ * devices through the session mode mirror.  A no-op for a remote copy, a
+ * device (alias) and a connection whose flag already matches.
+ * @param[in] cptr The connection.
+ * @param[in] flag The mode flag (enum Flag).
+ * @param[in] on Nonzero to set it, zero to clear it.
+ */
+extern void umode_sync_apply(struct Client *cptr, int flag, int on);
 extern void send_umode_out(struct Client* cptr, struct Client* sptr,
                           struct Flags* old, int prop);
 extern int whisper(struct Client* source, const char* nick,

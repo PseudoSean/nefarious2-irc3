@@ -40,6 +40,7 @@ struct Client;
 struct User;
 struct Membership;
 struct SLink;
+struct MdSyncLink;
 
 /** Describes a server on the network. */
 struct Server {
@@ -68,6 +69,13 @@ struct Server {
 
   unsigned int ml_max_bytes;    /**< Remote server's MULTILINE_MAX_BYTES (0 = unknown/legacy) */
   unsigned int ml_max_lines;    /**< Remote server's MULTILINE_MAX_LINES (0 = unknown/legacy) */
+  unsigned long link_serial;    /**< Direct link: which establishment of a link
+                                     this is (server_estab), never reused; 0
+                                     for a server behind another */
+
+  struct MdSyncLink *mdsync;    /**< W4 stamped account-metadata sync state
+                                     for this direct link (metadata_sync.h);
+                                     lazily allocated, freed with the link */
 };
 
 /** Describes a user on the network. */

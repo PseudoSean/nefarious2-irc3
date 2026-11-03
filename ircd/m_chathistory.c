@@ -5414,6 +5414,11 @@ static void complete_redact_fed(struct FedRequest *req)
     sendcmdto_want_s2s_tags(1);
     sendcmdto_serv_butone_v3(sptr, CMD_REDACT, sptr, "%s %s :%s",
                           req->target, ctx->msgid, reason ? reason : "");
+
+    /* Disarm: this runs from a federation callback, outside any
+     * per-line reset, so a left-armed msgid tags the next unrelated
+     * client send with this REDACT's id (as m_redact.c does). */
+    sendcmdto_set_client_msgid(NULL);
   }
 }
 
@@ -6877,7 +6882,12 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     int has_more = 0;
     int is_continuation = 0;
 
-    if (parc < 4)
+    /* The shortest form is the final continuation, "B <reqid> <msgid>
+     * :<b64>" (parc 5).  A 4-param line has no data: the continuation
+     * branch below would take the NULL parv[4] as its base64 and
+     * strlen() it.  Drop it here, before the forward, so it never
+     * reaches the request's origin either. */
+    if (parc < 5)
       return 0;
 
     reqid = parv[2];
@@ -7215,7 +7225,11 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     int has_more = 0;
     int is_continuation = 0;
 
-    if (parc < 4)
+    /* The shortest form is the final continuation, "WB <target> <msgid>
+     * :<b64>" (parc 5).  A 4-param line has no data: the continuation
+     * branch below would take the NULL parv[4] as its base64 and
+     * strlen() it. */
+    if (parc < 5)
       return 0;
 
     target = parv[2];

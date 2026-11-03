@@ -89,6 +89,12 @@ extern void sendcmdto_set_s2s_tags(uint64_t time_ms, const char *msgid);
  * S2S emit.  Per redesign A.2: bouncer-aware peers receive sessid for at-N-time
  * convergence dispatch in m_nick.  Auto-cleared after consumption. */
 extern void sendcmdto_set_s2s_sessid(const char *sessid);
+/* Arm the bouncer hold mark (,H<mark> segment, BOUNCE_HOLD_MARK_*) for the
+ * next S2S emit.  It travels only with the session id armed by
+ * sendcmdto_set_s2s_sessid(): arm the session id first (arming a session
+ * id disarms the mark), and a mark armed without one is dropped.  0
+ * disarms.  Consumed and cleared with the session id. */
+extern void sendcmdto_set_s2s_held(char mark);
 /* Arm the multiline framing segment ,M<flag><batch_ref> for the next
  * sendcmdto_one_tags_with_client() toward a tag-carrying link (audit 0.1).
  * Consumed or cleared by that call. */
@@ -196,11 +202,7 @@ extern void sendcmdto_serv_butone_v3(struct Client *from, const char *cmd,
  * or any other fork-only token, through this helper: legacy peers
  * silently drop what they don't recognise and the emission is wasted.
  * Never builds a tagged line — see the definition comment in send.c.
- *
- * Intended use site (BX P): at every BX C emission, also emit a paired
- * BX P through this helper so legacy peers reconcile their nick-hash and
- * UserStats.clients count via the existing BX P swap path (see
- * .claude/para/projects/legacy-bx-p-in-place-conversion.md). */
+ * A BX C emission is not paired with a BX P (see send.c). */
 extern void sendcmdto_legacy_serv_butone(struct Client *from, const char *cmd,
 				         const char *tok, struct Client *one,
 				         const char *pattern, ...);
@@ -228,6 +230,15 @@ extern void sendcmdto_common_channels_butone(struct Client *from,
 					     const char *tok,
 					     struct Client *one,
 					     const char *pattern, ...);
+
+/* Send command to the local members of every channel @a from is on, except
+ * @a from and its own bouncer aliases: its devices share its nick, so a
+ * line from that nick -- the QUIT of a face leaving the network while its
+ * connection carries on as a device (W3 12c-3) -- is not theirs to see. */
+extern void sendcmdto_common_channels_but_session(struct Client *from,
+                                                  const char *cmd,
+                                                  const char *tok,
+                                                  const char *pattern, ...);
 
 /* Send command to all channels user is on with or without a specified capability */
 extern void sendcmdto_common_channels_capab_butone(struct Client *from,

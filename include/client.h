@@ -29,6 +29,9 @@
 #ifndef INCLUDED_account_id_h
 #include "account_id.h"      /* ACCOUNT_ID_LEN */
 #endif
+#ifndef INCLUDED_sessid_index_h
+#include "sessid_index.h"    /* struct SessidLink */
+#endif
 #ifndef INCLUDED_dbuf_h
 #include "dbuf.h"
 #endif
@@ -214,6 +217,18 @@ enum Flag
                                          emit BX F, so we must NOT gate on
                                          it (gate would hang the burst).
                                          Advertised via 'F' in SERVER flags. */
+    FLAG_HOLDMARK,                  /**< server stamps its own users' N with
+                                         the bouncer hold mark (compact-tag
+                                         ,H segment) and relays the marks it
+                                         receives.  Advertised via 'H' in
+                                         SERVER flags, only while
+                                         P10_MESSAGE_TAGS is on. */
+    FLAG_HOLDMARK_SENT,             /**< on a server link: OUR SERVER line to
+                                         it announced 'H'.  The far end of
+                                         a path judges our marks by that
+                                         announcement, so our trust in the
+                                         marks arriving over this link asks
+                                         it too (bounce_hold_marks_trusted). */
     FLAG_GOTID,                     /**< successful ident lookup achieved */
     FLAG_DOID,                      /**< I-lines say must use ident return */
     FLAG_NONL,                      /**< No \n in buffer */
@@ -469,6 +484,10 @@ struct Connection
   char                con_s2s_sessid[S2S_SESSID_BUFSIZE]; /**< S2S compact-tag ,S<sessid> segment from incoming message — bouncer session identity hint per redesign A.2 */
 #define S2S_ML_BUFSIZE 32  /**< ML framing: one flag byte + a multiline batch reference (senders use <=15) + NUL */
   char                con_s2s_ml[S2S_ML_BUFSIZE]; /**< S2S compact-tag ,M<flag><batchref> segment (multiline framing, audit 0.1); empty when absent */
+  char                con_s2s_held;  /**< S2S compact-tag ,H<x> segment: the bouncer hold mark of the N's client (BOUNCE_HOLD_MARK_*), 0 when absent or invalid */
+  struct Client*      con_burst_stamp_link; /**< Local client: the server link our last burst N for it went to with a hold mark (compared only, never dereferenced) */
+  char                con_burst_stamp; /**< Local client: the hold mark (BOUNCE_HOLD_MARK_*) that N carried, 0 when none */
+  unsigned long       con_burst_stamp_serial; /**< Local client: that link's link_serial when the N went (struct Server) */
   char                con_s2s_batch_id[32]; /**< Active S2S batch ID from server */
   char                con_s2s_batch_type[16]; /**< Active S2S batch type (netjoin, netsplit) */
   unsigned char       con_pre_away;   /**< Pre-registration away state: 0=none, 1=away, 2=away-star */
@@ -609,8 +628,19 @@ struct Client {
    * all clients in a future phase).  Empty string if not yet generated.
    * Used as the presence anchor for ephemeral METADATA / READ_MARKER /
    * CHATHISTORY (PM) and as the source of truth for the wire-emitted
-   * ,S<sessid> compact tag on outgoing N introductions. */
+   * ,S<sessid> compact tag on outgoing N introductions.
+   *
+   * The ONLY writer is client_set_session_id() (list.c) -- it keeps
+   * this field and cli_sesslink below (the session-id -> Client index)
+   * in agreement.  Never write cli_session_id directly. */
   char                  cli_session_id[S2S_SESSID_BUFSIZE];
+
+  /** This Client's filing in the session-id -> Client index
+   * (sessid_index.h), keyed by cli_session_id.  One id can name
+   * several Clients at once (a bouncer primary and its aliases; two
+   * kept-apart sessions that briefly share an id), so a lookup is a
+   * multi-match the caller interprets, not a single answer. */
+  struct SessidLink     cli_sesslink;
 
   /* Phase C: in-memory PM ring for ephemeral↔ephemeral conversations.
    * NULL until first insert; freed in ephemeral_purge_session.  Defined
@@ -699,8 +729,18 @@ struct Client {
 #define cli_s2s_sessid(cli)      con_s2s_sessid(cli_connect(cli))
 /** Get multiline framing (flag + batch reference) from compact-tag ,M segment of incoming S2S message */
 #define cli_s2s_ml(cli)          con_s2s_ml(cli_connect(cli))
+/** Get the bouncer hold mark from compact-tag ,H segment of incoming S2S message (0 = none) */
+#define cli_s2s_held(cli)        con_s2s_held(cli_connect(cli))
+/** Get the link our last burst N for a local client carried a hold mark to */
+#define cli_burst_stamp_link(cli) con_burst_stamp_link(cli_connect(cli))
+/** Get the hold mark that burst N carried (0 = none) */
+#define cli_burst_stamp(cli)     con_burst_stamp(cli_connect(cli))
+/** Get the link incarnation the burst stamp was recorded for */
+#define cli_burst_stamp_serial(cli) con_burst_stamp_serial(cli_connect(cli))
 /** Get per-Client session ID (UUID v7 base64 — generated at make_client, adopted by bouncer on resume). */
 #define cli_session_id(cli)      ((cli)->cli_session_id)
+/** Get this Client's session-id index filing (sessid_index.h). */
+#define cli_sesslink(cli)         ((cli)->cli_sesslink)
 /** Get S2S batch ID from server */
 #define cli_s2s_batch_id(cli)	con_s2s_batch_id(cli_connect(cli))
 /** Get S2S batch type from server */
@@ -1032,6 +1072,14 @@ struct Client {
 #define con_s2s_sessid(con)      ((con)->con_s2s_sessid)
 /** Get the multiline framing (flag + batch reference) from compact-tag ,M segment of incoming S2S message. */
 #define con_s2s_ml(con)          ((con)->con_s2s_ml)
+/** Get the bouncer hold mark from compact-tag ,H segment of incoming S2S message. */
+#define con_s2s_held(con)        ((con)->con_s2s_held)
+/** Get the link our last burst N for this local client carried a hold mark to. */
+#define con_burst_stamp_link(con) ((con)->con_burst_stamp_link)
+/** Get the hold mark that burst N carried. */
+#define con_burst_stamp(con)     ((con)->con_burst_stamp)
+/** Get the link incarnation the burst stamp was recorded for. */
+#define con_burst_stamp_serial(con) ((con)->con_burst_stamp_serial)
 /** Get the S2S batch ID from server. */
 #define con_s2s_batch_id(con)	((con)->con_s2s_batch_id)
 /** Get the S2S batch type from server. */
@@ -1284,6 +1332,10 @@ struct Client {
 #define IsRenameCapable(x)      HasFlag(x, FLAG_RENAME_CAPABLE)
 /** Return non-zero if the server emits BX F (reconcile-end) markers. */
 #define IsBxfAware(x)           HasFlag(x, FLAG_BXF_AWARE)
+/** Return non-zero if the server stamps and relays the bouncer hold mark. */
+#define IsHoldMark(x)           HasFlag(x, FLAG_HOLDMARK)
+/** Return non-zero if our SERVER line to this link announced 'H'. */
+#define IsHoldMarkSent(x)       HasFlag(x, FLAG_HOLDMARK_SENT)
 /** Return non-zero if the client has an account stamp. */
 #define IsAccount(x)            HasFlag(x, FLAG_ACCOUNT)
 /** Return non-zero if the client has set mode +x (hidden host). */
@@ -1436,6 +1488,10 @@ struct Client {
 #define SetRenameCapable(x)     SetFlag(x, FLAG_RENAME_CAPABLE)
 /** Mark a server as supporting the BX F handshake. */
 #define SetBxfAware(x)          SetFlag(x, FLAG_BXF_AWARE)
+/** Mark a server as stamping and relaying the bouncer hold mark. */
+#define SetHoldMark(x)          SetFlag(x, FLAG_HOLDMARK)
+/** Record that our SERVER line to this link announced 'H'. */
+#define SetHoldMarkSent(x)      SetFlag(x, FLAG_HOLDMARK_SENT)
 /** Mark a client as having an account stamp. */
 #define SetAccount(x)           SetFlag(x, FLAG_ACCOUNT)
 /** Mark a client as having mode +x (hidden host). */

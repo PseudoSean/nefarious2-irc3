@@ -42,15 +42,20 @@ CMOCKA_TESTPROGS = \
 	chathistory_presence_cmocka \
 	recv_classify_cmocka \
 	register_throttle_cmocka \
+	ipcheck_refund_cmocka \
 	fakelag_cmocka \
 	webpush_mute_cmocka \
 	webpush_expiry_cmocka \
 	webpush_keyring_cmocka \
 	webpush_attention_cmocka \
 	bouncer_converge_cmocka \
+	bouncer_wire_cmocka \
+	bouncer_count_cmocka \
 	bouncer_rebind_auth_cmocka \
 	exit_reason_cmocka \
 	bouncer_deauth_cmocka \
+	sessid_index_cmocka \
+	metadata_lww_cmocka \
 	webpush_line_cmocka \
 	websocket_cmocka \
 	db_casefold_cmocka \
@@ -83,15 +88,20 @@ DEP_SRC = \
 	chathistory_presence_cmocka.c \
 	recv_classify_cmocka.c \
 	register_throttle_cmocka.c \
+	ipcheck_refund_cmocka.c \
 	fakelag_cmocka.c \
 	webpush_mute_cmocka.c \
 	webpush_expiry_cmocka.c \
 	webpush_keyring_cmocka.c \
 	webpush_attention_cmocka.c \
 	bouncer_converge_cmocka.c \
+	bouncer_wire_cmocka.c \
+	bouncer_count_cmocka.c \
 	bouncer_rebind_auth_cmocka.c \
 	exit_reason_cmocka.c \
 	bouncer_deauth_cmocka.c \
+	sessid_index_cmocka.c \
+	metadata_lww_cmocka.c \
 	webhook_eventlog_cmocka.c \
 	webpush_line_cmocka.c \
 	kc_url_cmocka.c \
@@ -223,6 +233,16 @@ REGISTER_THROTTLE_CMOCKA_OBJS = register_throttle_cmocka.o register_throttle_tes
 register_throttle_cmocka: $(REGISTER_THROTTLE_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(REGISTER_THROTTLE_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
+# ipcheck_refund tests - the module is recompiled with a 1-bucket, 2-slot
+# table so a full bucket is reachable with arbitrary account names.
+# No test_stub.o: the module is pure by design (no log_write, no ircd deps).
+ipcheck_refund_test.o: ../ipcheck_refund.c ../../include/ipcheck_refund.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -DIPCHECK_REFUND_TABLE_BITS=0 -DIPCHECK_REFUND_BUCKET_DEPTH=2 -c -o $@ ../ipcheck_refund.c
+
+IPCHECK_REFUND_CMOCKA_OBJS = ipcheck_refund_cmocka.o ipcheck_refund_test.o
+ipcheck_refund_cmocka: $(IPCHECK_REFUND_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(IPCHECK_REFUND_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
 # fake-lag credit: header-only (include/fakelag.h)
 FAKELAG_CMOCKA_OBJS = fakelag_cmocka.o
 fakelag_cmocka: $(FAKELAG_CMOCKA_OBJS)
@@ -271,10 +291,11 @@ kc_error_classify_cmocka: $(KC_ERROR_CLASSIFY_CMOCKA_OBJS)
 # engine.  The event layer is a fake in the test with the kernel's fd
 # semantics (lowest free number on open, epoll registrations keyed by the
 # number and dropped on close), so an engine call made with a number libkc
-# already gave back is observable.  No libkc objects are linked.
+# already gave back is observable.  No libkc objects are linked; libcrypto
+# is, for the OpenSSL error-queue drain after each call into libkc.
 IRCD_KC_ADAPTER_CMOCKA_OBJS = ircd_kc_adapter_cmocka.o test_stub.o ../ircd_kc_adapter.o
 ircd_kc_adapter_cmocka: $(IRCD_KC_ADAPTER_CMOCKA_OBJS)
-	${CC} -o $@ $(LDFLAGS) $(IRCD_KC_ADAPTER_CMOCKA_OBJS) $(CMOCKA_LIBS)
+	${CC} -o $@ $(LDFLAGS) $(IRCD_KC_ADAPTER_CMOCKA_OBJS) $(CMOCKA_LIBS) $(SSL_LIBS)
 # websocket tests - frame decoding and handshake accumulation (#98, #99).
 # Includes websocket.c directly with stubs; needs OpenSSL for the accept key.
 WEBSOCKET_CMOCKA_OBJS = websocket_cmocka.o test_stub.o ../ircd_alloc.o ../ircd_string.o
@@ -420,12 +441,32 @@ webpush_attention_cmocka: $(WEBPUSH_ATTENTION_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(WEBPUSH_ATTENTION_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 # bouncer_converge tests - the module is pure (no ircd deps)
-bouncer_converge_test.o: ../bouncer_converge.c ../../include/bouncer_converge.h
+# The suite also links bouncer_wire (the hold-mark stamp it composes with).
+bouncer_converge_test.o: ../bouncer_converge.c ../../include/bouncer_converge.h \
+		../../include/bouncer_wire.h
 	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../bouncer_converge.c
 
-BOUNCER_CONVERGE_CMOCKA_OBJS = bouncer_converge_cmocka.o bouncer_converge_test.o
+BOUNCER_CONVERGE_CMOCKA_OBJS = bouncer_converge_cmocka.o bouncer_converge_test.o \
+	bouncer_wire_test.o
 bouncer_converge_cmocka: $(BOUNCER_CONVERGE_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(BOUNCER_CONVERGE_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# bouncer_wire tests - the module is pure (no ircd deps)
+bouncer_wire_test.o: ../bouncer_wire.c ../../include/bouncer_wire.h \
+		../../include/bouncer_rebind_auth.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../bouncer_wire.c
+
+BOUNCER_WIRE_CMOCKA_OBJS = bouncer_wire_cmocka.o bouncer_wire_test.o
+bouncer_wire_cmocka: $(BOUNCER_WIRE_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(BOUNCER_WIRE_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# bouncer_count tests - the module is pure (no ircd deps)
+bouncer_count_test.o: ../bouncer_count.c ../../include/bouncer_count.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../bouncer_count.c
+
+BOUNCER_COUNT_CMOCKA_OBJS = bouncer_count_cmocka.o bouncer_count_test.o
+bouncer_count_cmocka: $(BOUNCER_COUNT_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(BOUNCER_COUNT_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 # bouncer_deauth tests - the module is pure (no ircd deps)
 bouncer_deauth_test.o: ../bouncer_deauth.c ../../include/bouncer_deauth.h
@@ -434,6 +475,22 @@ bouncer_deauth_test.o: ../bouncer_deauth.c ../../include/bouncer_deauth.h
 BOUNCER_DEAUTH_CMOCKA_OBJS = bouncer_deauth_cmocka.o bouncer_deauth_test.o
 bouncer_deauth_cmocka: $(BOUNCER_DEAUTH_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(BOUNCER_DEAUTH_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# sessid_index tests - the module is pure (no ircd deps)
+sessid_index_test.o: ../sessid_index.c ../../include/sessid_index.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../sessid_index.c
+
+SESSID_INDEX_CMOCKA_OBJS = sessid_index_cmocka.o sessid_index_test.o
+sessid_index_cmocka: $(SESSID_INDEX_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(SESSID_INDEX_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# metadata_lww tests - the module is pure (no ircd deps)
+metadata_lww_test.o: ../metadata_lww.c ../../include/metadata_lww.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../metadata_lww.c
+
+METADATA_LWW_CMOCKA_OBJS = metadata_lww_cmocka.o metadata_lww_test.o
+metadata_lww_cmocka: $(METADATA_LWW_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(METADATA_LWW_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 # webhook_eventlog tests - the applied-events log is pure (no ircd deps, no jansson)
 webhook_eventlog_test.o: ../webhook_eventlog.c ../../include/webhook_eventlog.h

@@ -1785,6 +1785,7 @@ int parse_server(struct Client *cptr, char *buffer, char *bufend)
   cli_s2s_client_tags(cptr)[0] = '\0';
   cli_s2s_sessid(cptr)[0] = '\0';
   cli_s2s_ml(cptr)[0] = '\0';
+  cli_s2s_held(cptr) = '\0';
 
   if (*ch == '@') {
     /* Find the end of tags (first space after @) */
@@ -1837,6 +1838,7 @@ int parse_server(struct Client *cptr, char *buffer, char *bufend)
            * tagend. Marker is a single ASCII char identifying the
            * segment type:
            *   S — bouncer session-identity hint
+           *   H — bouncer hold mark of the N's client (one of h, p, n)
            *   M — multiline framing, <flag><batchref> (ML lines only)
            *   C — client-only tags (literal IRCv3 client-tag string)
            * Unknown markers are silently skipped (forward-compatible
@@ -1897,6 +1899,17 @@ int parse_server(struct Client *cptr, char *buffer, char *bufend)
               }
               break;
             }
+            case 'H': {
+              /* Bouncer hold mark: what the N's client is on its home
+               * server -- a held ghost, a live session primary, or a
+               * live login that is not a session's primary -- for the
+               * same-nick verdict.  Exactly one of the three letters;
+               * anything else reads as no mark. */
+              size_t data_len = seg_end - seg_data;
+              if (data_len == 1 && bounce_hold_mark_valid(seg_data[0]))
+                cli_s2s_held(cptr) = seg_data[0];
+              break;
+            }
             case 'M': {
               /* Multiline framing (audit 0.1): one flag byte ('+'
                * start, 'c' concat, '-' end, '.' plain) followed by the
@@ -1952,22 +1965,16 @@ int parse_server(struct Client *cptr, char *buffer, char *bufend)
           {
             static time_t hlc_refuse_rate;
             uint64_t ahead = 0;
-            int hlc_max_forward = feature_int(FEAT_HLC_MAX_FORWARD_MS);
+            uint64_t hlc_max_forward = hlc_max_forward_ms();
 
-            /* A negative config value has no sane bounded meaning; treat
-             * it as unbounded (0) rather than widening it to uint64_t,
-             * where it would sign-extend to a huge max_forward_ms. */
-            if (hlc_global_receive(&remote_hlc,
-                                    (hlc_max_forward < 0) ? 0 :
-                                      (uint64_t)hlc_max_forward,
-                                    &ahead))
+            if (hlc_global_receive(&remote_hlc, hlc_max_forward, &ahead))
               sendto_opmask_butone_ratelimited(0, SNO_NETWORK, &hlc_refuse_rate,
                                                "Clock of %s is %llu ms ahead of ours "
-                                               "(HLC_MAX_FORWARD_MS %d); its time was "
+                                               "(HLC_MAX_FORWARD_MS %llu); its time was "
                                                "not adopted",
                                                cli_name(cptr),
                                                (unsigned long long)ahead,
-                                               hlc_max_forward);
+                                               (unsigned long long)hlc_max_forward);
           }
         }
       }
@@ -2138,9 +2145,15 @@ int parse_server(struct Client *cptr, char *buffer, char *bufend)
    */
   s = strchr(ch, ' ');          /* s -> End of the command code */
   len = (s) ? (s - ch) : 0;
-  if (len == 3 && IsDigit(*ch))
+  if (len == 3 && IsDigit(*ch) && IsDigit(*(ch + 1)) && IsDigit(*(ch + 2)))
   {
     numeric = (*ch - '0') * 100 + (*(ch + 1) - '0') * 10 + (*(ch + 2) - '0');
+    /* 000 is no numeric, and the dispatch below takes numeric == 0 for
+     * a command with mptr set: drop it as an unknown command. */
+    if (numeric == 0) {
+      ServerStats->is_unco++;
+      return (-1);
+    }
     paramcount = 2; /* destination, and the rest of it */
     ServerStats->is_num++;
     mptr = NULL;                /* Init. to avoid stupid compiler warning :/ */

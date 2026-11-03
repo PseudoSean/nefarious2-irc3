@@ -183,17 +183,19 @@ static int parse_ws_handshake(const char *buffer, int length,
       /* Token-boundary scan (a hypothetical "notext.ircv3.net" must
        * not match); first supported token wins, and a preference
        * already chosen from an earlier header line is never
-       * overridden, so multi-header requests keep client order. */
+       * overridden, so multi-header requests keep client order.
+       * The line is not NUL-terminated at its "\r\n", so every step is
+       * bounded by end; each pass consumes at least one byte. */
       const char *p = line + 23;
-      while (*p && *subproto == WS_SUBPROTO_NONE) {
+      while (p < end && *subproto == WS_SUBPROTO_NONE) {
         const char *e;
         size_t n;
-        while (*p == ' ' || *p == '\t' || *p == ',')
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ','))
           p++;
-        if (!*p)
+        if (p >= end)
           break;
         e = p;
-        while (*e && *e != ',' && *e != ' ' && *e != '\t' && *e != '\r')
+        while (e < end && *e != ',' && *e != ' ' && *e != '\t')
           e++;
         n = (size_t)(e - p);
         if (n == 14 && 0 == strncasecmp(p, "text.ircv3.net", 14))
@@ -385,6 +387,7 @@ int websocket_handshake(struct Client *cptr, const char *buffer, int length)
     resp_len = build_ws_forbidden_response(response);
     if (cli_socket(cptr).ssl) {
       SSL_write(cli_socket(cptr).ssl, response, resp_len);
+      ssl_clear_errors("after SSL_write");  /* unchecked: leave nothing */
     } else {
       unsigned int bytes_sent;
       os_send_nonb(cli_fd(cptr), response, resp_len, &bytes_sent);
@@ -407,6 +410,8 @@ int websocket_handshake(struct Client *cptr, const char *buffer, int length)
   /* Use SSL_write for SSL connections, os_send_nonb for plain */
   if (cli_socket(cptr).ssl) {
     int send_result = SSL_write(cli_socket(cptr).ssl, response, resp_len);
+    /* Its failure is not read through SSL_get_error(): leave nothing. */
+    ssl_clear_errors("after SSL_write");
     if (send_result <= 0) {
       Debug((DEBUG_DEBUG, "WebSocket: Failed to send handshake response to %s (SSL_write returned %d)",
              cli_sockhost(cptr), send_result));
@@ -759,6 +764,7 @@ static int ws_send_raw(struct Client *cptr, const unsigned char *data, int len)
     int result;
 
     memcpy(copy, data, len);
+    ssl_clear_errors("before SSL_write");
     result = SSL_write(cli_socket(cptr).ssl, copy, len);
     if (result > 0) {
       MyFree(copy);

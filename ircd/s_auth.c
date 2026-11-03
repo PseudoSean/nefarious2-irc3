@@ -767,6 +767,13 @@ static int check_auth_finished(struct AuthRequest *auth)
       if (IsAccount(auth->client) && bounce_enabled_for(auth->client)
           && bounce_burst_in_progress()
           && bounce_defer_registration(auth->client) == 0) {
+        /* The wait from here is the server's, not the client's: a full
+         * CONNECTTIMEOUT for it, as register_user()'s own defer gives
+         * (register_user_unwind()); a re-defer by the drain keeps this
+         * clock, so the wait stays bounded.  Without it a login that
+         * spent most of its window in CAP/SASL met "Registration Timeout"
+         * part-way through a long netburst (W3 12c-2b carry, Minor 4). */
+        cli_firsttime(auth->client) = CurrentTime;
         sendrawto_one(auth->client,
                       "NOTICE * :*** Bouncer: SASL complete, waiting "
                       "for burst convergence before registration "
@@ -3302,7 +3309,8 @@ static void iauth_parse(struct IAuth *iauth, char *message)
     /* Try to find the client associated with the request. */
     char *endptr;
     errno = 0;
-    id = strtol(params[0], &endptr, 10);
+    /* params[0] is NULL when the line has no parameters. */
+    id = (parc >= 3) ? strtol(params[0], &endptr, 10) : 0;
     if (parc < 3)
       sendto_iauth(NULL, "E Missing :Need <id> <ip> <port>");
     else if (errno == ERANGE || endptr == params[0] || (*endptr && !IsSpace(*endptr)))
@@ -3380,7 +3388,7 @@ static void iauth_read(struct IAuth *iauth)
   /* Parse each complete line. */
   for (sol = readbuf; (eol = strchr(sol, '\n')) != NULL; sol = eol + 1) {
     *eol = '\0';
-    if (*(eol - 1) == '\r') /* take out carriage returns, too... */
+    if (eol > sol && *(eol - 1) == '\r') /* take out carriage returns, too... */
       *(eol - 1) = '\0';
 
     /* If spammy debug, send the message to opers. */
@@ -3464,7 +3472,7 @@ static void iauth_read_stderr(struct IAuth *iauth)
   /* Send each complete line to SNO_AUTH. */
   for (sol = readbuf; (eol = strchr(sol, '\n')) != NULL; sol = eol + 1) {
     *eol = '\0';
-    if (*(eol - 1) == '\r') /* take out carriage returns, too... */
+    if (eol > sol && *(eol - 1) == '\r') /* take out carriage returns, too... */
       *(eol - 1) = '\0';
     Debug((DEBUG_ERROR, "IAuth error: %s", sol));
     log_write(LS_IAUTH, L_ERROR, 0, "IAuth error: %s", sol);

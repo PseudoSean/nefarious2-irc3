@@ -94,6 +94,7 @@
 #include "ircd_reply.h"
 #include "ircd_string.h"
 #include "match.h"
+#include "metadata_sync.h"
 #include "msg.h"
 #include "numeric.h"
 #include "numnicks.h"
@@ -140,13 +141,11 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
   /* (BX R retired in Phase 5; convergence is at-N-time per redesign
    * D.1 + D.3 — no EOB demote-retry pass.) */
 
-  /* Drain any deferred local-user registrations.  These were queued by
-   * check_auth_finished when SASL completed mid-burst — registering
-   * immediately would have created a fresh standalone primary racing
-   * peer's in-flight N for the same account.  Only drain when no peer
-   * is still bursting; otherwise wait for the last EOB to fire. */
-  if (!bounce_burst_in_progress())
-    bounce_drain_pending_registrations();
+  /* Deferred local-user registrations (queued by check_auth_finished when
+   * SASL completed mid-burst) are drained at the end of this read of the
+   * link (bounce_link_input_read()), once no peer is still bursting, not
+   * inside this line: lines after the EB in the same read are part of
+   * what the registration must see (W3 12c-2b fix round 3, I-1). */
 
   /* Prune stale alias entries from all sessions.  A peer's burst is
    * the authoritative source of which numerics it currently holds;
@@ -187,6 +186,17 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
      * line as a parse error -- up to 20000 of them per relink (audit P4). */
     if (IsIRCv3Aware(sptr))
       presence_burst_sync(sptr);
+
+    /* W4 Task 10: re-pull every attached account (not only the ones
+     * this link introduced) now that this direct peer has finished
+     * telling us everything it has -- a relink can follow a split
+     * during which THIS link's view went stale regardless of which
+     * side an account is nominally on.  Self-gated on IsIRCv3Aware and
+     * storage availability inside; the stock slot (legacy, no MD at
+     * all) never gets this call to begin with here, same as
+     * presence_burst_sync just above. */
+    if (IsIRCv3Aware(sptr))
+      mdsync_link_eob(sptr);
 
     /* Webhook plan 4: catch the peer up on the Keycloak events applied
      * here while it was away (netsplit, downtime, a new server); it

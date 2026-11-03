@@ -1023,6 +1023,9 @@ static struct FeatureDesc {
   F_I(IPCHECK_CLONE_LIMIT, 0, 4, 0),
   F_I(IPCHECK_CLONE_PERIOD, 0, 40, 0),
   F_I(IPCHECK_CLONE_DELAY, 0, 600, 0),
+  F_B(IPCHECK_COUNT_REFUSALS, 0, 1, 0),
+  F_I(IPCHECK_SASL_REFUND, 0, 0, 0),
+  F_I(IPCHECK_SASL_REFUND_PERIOD, 0, 600, 0),
   F_I(CHANNELLEN, 0, 200, set_isupport_channellen),
 
   /* Some misc. default paths */
@@ -1433,6 +1436,7 @@ static struct FeatureDesc {
   F_B(METADATA_DB_NORDAHEAD, 0, 1, 0),
   F_I(METADATA_CACHE_TTL, 0, 14400, 0),
   F_I(METADATA_PURGE_FREQUENCY, 0, 3600, feature_notify_metadata_purge_frequency),
+  F_I(METADATA_TOMBSTONE_TTL, 0, 2592000, 0), /* 30 days; a D clock row older than this is purged */
 #ifdef USE_ZSTD
   F_I(COMPRESS_THRESHOLD, 0, 256, feature_notify_compress_threshold),
   F_I(COMPRESS_LEVEL, 0, 3, feature_notify_compress_level),

@@ -464,6 +464,18 @@ int m_join(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           continue;
       }
 
+      /* A device of another server's primary cannot join a local (&)
+       * channel of ours: the JOIN is its primary's, and our local channel
+       * does not exist on the primary's server -- it answers 403 for it, as
+       * we do here, to the device that asked (W3 Task 11 fix 1, ruling
+       * W3-T11-f1a).  Joined, a client of another server would sit in a
+       * channel only we have: every member's line in it routed there and
+       * answered 403. */
+      if (alias_source && !MyConnect(sptr) && IsLocalChannel(name)) {
+        send_reply(alias_source, ERR_NOSUCHCHANNEL, name);
+        continue;
+      }
+
       if (cli_user(sptr)->joined >= get_client_maxchans(sptr)
           && !HasPriv(sptr, PRIV_CHAN_LIMIT)) {
         send_reply(sptr, ERR_TOOMANYCHANNELS, name);
@@ -710,10 +722,16 @@ int ms_join(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       }
     }
 
-    /* Pre-populate this channel's msgid from the incoming S2S tag */
+    /* Pre-populate this channel's msgid from the incoming S2S tag.  A
+     * channel past its MAXJOINARGS slots, or one whose slot is empty,
+     * mints its own: a JOIN joinbuf never flushes, so every channel
+     * uses slot 0, and without the clear it reused the msgid the
+     * previous channel left there. */
     if (chan_idx < MAXJOINARGS && incoming_msgids[chan_idx][0])
       ircd_strncpy(join.jb_msgids[join.jb_count], incoming_msgids[chan_idx],
                     sizeof(join.jb_msgids[0]));
+    else
+      join.jb_msgids[join.jb_count][0] = '\0';
 
     joinbuf_join(&join, chptr, flags);
   }
